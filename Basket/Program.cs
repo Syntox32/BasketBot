@@ -14,6 +14,7 @@ using System.Threading;
 using System.Timers;
 using System.Diagnostics;
 using System.Windows.Input;
+using Emgu.CV.OCR;
 
 namespace Basket
 {
@@ -33,10 +34,16 @@ namespace Basket
         private string _title;
         private Process _adbProc;
         private ProcessStartInfo _adbInfo;
+        private Tesseract _ocr;
+
+        private int _points = 0;
+        private float _interval = 1000 / 60;
+        private float _fps = 60;
 
         private RotatedRect _currScreenRect;
         private CircleF _currCircle;
         private LineSegment2DF _currBasket;
+        private Point _currBasketCenter;
 
         private bool _foundCircle = false;
         private bool _foundScreen = false;
@@ -57,7 +64,11 @@ namespace Basket
         public void Start()
         {
             CvInvoke.NamedWindow(_title, NamedWindowType.Normal);
-            // CvInvoke.NamedWindow("thresh", NamedWindowType.Normal);
+            // CvInvoke.NamedWindow("awd", NamedWindowType.Normal);
+
+            var tessdataPath = @"D:\Emgu\emgucv-windesktop 3.1.0.2282\Emgu.CV.World\tessdata";
+            _ocr = new Tesseract(tessdataPath, "eng", OcrEngineMode.TesseractCubeCombined);
+            _ocr.SetVariable("tessedit_char_whitelist", "ABCDEFGHIJKLMNOPQRSTUVWXYZ-1234567890"); //ABCDEFGHIJKLMNOPQRSTUVWXYZ-
 
             _timer = new System.Timers.Timer();
             _timer.Interval = 1000 / 60;
@@ -93,6 +104,11 @@ namespace Basket
             return (val - min) / (max - min);
         }
 
+        public float Lerp(float v0, float v1, float t)
+        {
+            return (1.0f - t) * v0 + t * v1;
+        }
+
         public Point ApproxBallPixelPos(RotatedRect rect, PointF ballCenter, int resWi, int resHe)
         {
             var distHor = ballCenter.X - rect.MinAreaRect().X;
@@ -120,17 +136,97 @@ namespace Basket
             _adbProc.Start();
         }
 
+        public int GetPoints(UMat frame)
+        {
+            //CvInvoke.Threshold(imageFrame, thresh, 200, 255, ThresholdType.BinaryInv);
+            // CvInvoke.CvtColor(frame, thresh, ColorConversion.Bgr2Gray);
+            UMat resized = new UMat(frame,
+                new Rectangle(
+                    new Point(
+                        _currScreenRect.MinAreaRect().X + 80,
+                        _currScreenRect.MinAreaRect().Y + 220
+                        ),
+                    new Size(
+                        110, //_currScreenRect.MinAreaRect().Width, 
+                        110 //_currScreenRect.MinAreaRect().Height
+                        )));
+            UMat thresh = new UMat();
+            CvInvoke.Threshold(resized, thresh, 200, 255, ThresholdType.Binary);
+
+            try
+            {
+
+                var builder = new StringBuilder();
+                // CvInvoke.Imshow("awd", thresh);
+
+                _ocr.Recognize(thresh);
+                Tesseract.Character[] words = _ocr.GetCharacters();
+
+                if (words.Length == 0) return -1;
+
+                for (int i = 0; i < words.Length; i++)
+                {
+                    builder.Append(words[i].Text);
+                }
+
+                string pointStr = builder.ToString();
+                pointStr = pointStr.Replace("O", "0");
+                //Console.WriteLine("shit: " + pointStr);
+                return Convert.ToInt32(pointStr);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex.Message);
+            }
+
+            return -1;
+        }
+
+        public PointF GetBallVelocity()
+        {
+            var ret = new PointF(0f, 0f);
+
+            if (arrPrevBasketPos.Count == 0)
+                return ret;
+
+            PointF avg = new PointF();
+            for (int i = 0; i < arrPrevBasketPos.Count; i++)
+            {
+                avg.X += (arrPrevBasketPos[i].X);
+                avg.Y += (arrPrevBasketPos[i].Y);
+            }
+
+            avg.X /= arrPrevBasketPos.Count;
+            avg.Y /= arrPrevBasketPos.Count;
+
+            avg.X /= _interval;
+            avg.Y /= _interval;
+
+            Console.WriteLine(avg.X);
+
+            if (arrPrevBasketPos.Count > 2)
+                arrPrevBasketPos.RemoveAt(0);
+
+            return avg;
+        }
+
         long ms = 0;
+        int calibrationCount = 10;
+        int calibrationTracker = 0;
+        int maxDist = 1000;
+        double flightTime = 0.7; // seconds
+        PointF velBasket = new PointF(0f, 0f);
+        Point currBasketCenter;
+        Point prevBasketCenter;
+        List<PointF> arrPrevBasketPos = new List<PointF>();
+
+        int maxVertPos = 0;
+        int minVertPos = 0;
+        PointF currVelocity = new PointF(0f, 0f);
+        PointF realPos;
 
         public void DetectOnce(object sender, EventArgs e)
         {
-            ms += (int)(1000 / 60);
-            if (ms > 1500)
-            {
-                ms = 0;
-                var pixPos = ApproxBallPixelPos(_currScreenRect, _currCircle.Center, ScreenResWidth, ScreenResHeight);
-                DoSwipe(pixPos.X, pixPos.Y, 730, 750, 100);
-            }
 
             Mat imageFrame = _capture.QueryFrame();
             //pictureBox.Image = imageFrame.Bitmap;
@@ -144,6 +240,38 @@ namespace Basket
             CvInvoke.PyrDown(grayImg, pyr);
             CvInvoke.PyrUp(pyr, grayImg);
 
+
+
+            ms += (int)(1000 / 60);
+            if (ms > 1500)
+            {
+                ms = 0;
+                var pixPos = ApproxBallPixelPos(_currScreenRect, _currCircle.Center, ScreenResWidth, ScreenResHeight);
+                var basketPixPos = ApproxBallPixelPos(_currScreenRect, new PointF((float)_currBasketCenter.X, (float)_currBasketCenter.Y), ScreenResWidth, ScreenResHeight);
+
+                var bestPoint2 = ApproxBallPixelPos(_currScreenRect, realPos, ScreenResWidth, ScreenResHeight);
+
+
+                if (_currBasketCenter.IsEmpty)
+                    DoSwipe(pixPos.X, pixPos.Y, 730, 750, 100);
+                else if (_points >= 9)
+                {
+                    DoSwipe(pixPos.X, pixPos.Y, bestPoint2.X, bestPoint2.Y, 100);
+                }
+                else
+                    DoSwipe(pixPos.X, pixPos.Y, basketPixPos.X, basketPixPos.Y, 100);
+
+                UMat matmat = new UMat();
+                grayImg.CopyTo(matmat);
+
+                _points = GetPoints(matmat.Clone());
+
+                //UMat matmat = new UMat();
+                //grayImg.CopyTo(matmat);
+            }
+            
+            
+            
             //pictureBox2.Image = grayImg.Bitmap;
 
             // Circles
@@ -155,7 +283,7 @@ namespace Basket
             double cannyThresholdLinking = 130.0;
             UMat cannyEdges = new UMat();
             CvInvoke.Canny(grayImg, cannyEdges, 120, cannyThresholdLinking);
-            //CvInvoke.Imshow(_title, cannyEdges);
+            // CvInvoke.Imshow("awd", grayImg);
 
             LineSegment2D[] lines = CvInvoke.HoughLinesP(
               cannyEdges,
@@ -278,6 +406,9 @@ namespace Basket
                 circleImg.Draw(_currScreenRect, new Bgr(Color.Aqua), 3);
             }
 
+            float avgCenterX = 0;
+            float avgCenterY = 0;
+            int count2 = 0;
             foreach (LineSegment2D line in lines)
             {
 
@@ -286,23 +417,115 @@ namespace Basket
                 {
                     PointF center = LineCenter(line);
                     var rect = _currScreenRect.MinAreaRect();
+                    
+                    // horizontal bounds
                     LineSegment2D seg = new LineSegment2D(new Point(rect.X, rect.Y), new Point(rect.X + rect.Width, rect.Y));
                     var dist = DistPointToLine(seg, center);
                     var ratio = Norm(rect.Y, rect.Y + rect.Height, dist);
 
-                    if (ratio > 0.2 && ratio < 0.5)
+                    // vertical bounds
+                    LineSegment2D vertSeg = new LineSegment2D(new Point(rect.X, rect.Y + rect.Height), new Point(rect.X, rect.Y));
+                    var vertDist = DistPointToLine(seg, center);
+                    var vertRatio = Math.Abs(Norm(rect.X, rect.X + rect.Width, vertDist));
+
+                    if (ratio > 0.2 && ratio < 0.5 && vertRatio > 0.0 && vertRatio < 1.0)
                     {
-                        Console.WriteLine(dist);
-                        Console.WriteLine(ratio);
-
-
+                        //Console.WriteLine(vertDist);
+                        //Console.WriteLine(vertRatio);
 
                         CvInvoke.Circle(circleImg, new Point((int)center.X, (int)center.Y), 5, new Bgr(0, 0, 255).MCvScalar, 3, LineType.FourConnected);
                         circleImg.Draw(line, new Bgr(Color.Green), 2);
+
+                        //
+                        {
+                            avgCenterX += center.X;
+                            avgCenterY += center.Y;
+                            // avgCenterX /= 2;
+                            //avgCenterY /= 2;
+                            count2++;
+                        }
+
                         //Console.WriteLine(line.Length);
                     }
                 }
             }
+
+            avgCenterX /= count2;
+            avgCenterY /= count2;
+
+            //if (calibrationTracker < calibrationCount)
+            //calibrationTracker++;
+            //else if (calibrationTracker >= calibrationCount)
+            //maxDist = 100;
+
+            // if (Math.Abs(_currBasketCenter.X - avgCenterX) < maxDist && Math.Abs(_currBasketCenter.X - avgCenterY) < maxDist)
+
+            //_currBasketCenter = new Point((int)Norm(avgCenterX, _currBasketCenter.X, 0.5f), (int)Norm(avgCenterY, _currBasketCenter.Y, 0.5f));
+
+            //if (_currBasketCenter.X == 0 && _currBasketCenter.Y == 0)
+            bool avgInScreen = _currScreenRect.MinAreaRect().IntersectsWith(new Rectangle((int)avgCenterX, (int)avgCenterY, 1, 1));
+            if (avgInScreen)
+                _currBasketCenter = new Point((int)Lerp((float)_currBasketCenter.X, (float)avgCenterX, 0.3f), (int)Lerp((float)_currBasketCenter.Y, (float)avgCenterY, 0.3f));
+            //else
+            //    _currBasketCenter = new Point((int)Norm(_currBasketCenter.X, avgCenterX, 0.5f), (int)Norm(_currBasketCenter.Y, avgCenterY, 0.5f));
+            CvInvoke.Circle(circleImg, _currBasketCenter, 10, new Bgr(255, 0, 255).MCvScalar, 2, LineType.FourConnected);
+
+            velBasket = GetBallVelocity();
+            velBasket.X -= 21.0f;
+            velBasket.Y -= 11.25f;
+
+            if (Math.Abs(velBasket.X) > currVelocity.X)
+                currVelocity.X = Math.Abs(velBasket.X);
+            if (Math.Abs(velBasket.Y) > currVelocity.Y)
+                currVelocity.Y = Math.Abs(velBasket.Y);
+
+            if (avgInScreen)
+                arrPrevBasketPos.Add(_currBasketCenter);
+
+            var rect2 = _currScreenRect.MinAreaRect();
+            LineSegment2D vertSeg2 = new LineSegment2D(new Point(rect2.X + rect2.Width, rect2.Y), new Point(rect2.X + rect2.Width, rect2.Y + rect2.Height));
+            var vertDist2 = DistPointToLine(vertSeg2, _currBasketCenter);
+            var vertRatio2 = Math.Abs(Norm(rect2.X, rect2.X + rect2.Width, vertDist2));
+
+            if (minVertPos == 0) minVertPos = 164; //(int)vertDist2;
+            if (maxVertPos == 0) maxVertPos = 164; //(int)vertDist2;
+
+            if (vertDist2 > maxVertPos && vertDist2 < 230)
+                maxVertPos = (int)vertDist2;
+
+            if (vertDist2 < minVertPos)
+                minVertPos = (int)vertDist2;
+
+            //realPos = new PointF(0, 0); 
+            //if (velBasket.X > 0)
+            realPos = new PointF((float)_currBasketCenter.X + (float)(velBasket.X * 0.7 * _interval), (float)_currBasketCenter.Y);
+            //else
+                //realPos = new PointF((float)_currBasketCenter.X + (float)(velBasket.X * 0.7 * _interval), (float)_currBasketCenter.Y);
+            var bestPoint = ApproxBallPixelPos(_currScreenRect, realPos, ScreenResWidth, ScreenResHeight);
+
+            //var pixPos = ApproxBallPixelPos(_currScreenRect, _currCircle.Center, ScreenResWidth, ScreenResHeight);
+            //var basketPixPos = ApproxBallPixelPos(_currScreenRect, new PointF((float)_currBasketCenter.X, (float)_currBasketCenter.Y), ScreenResWidth, ScreenResHeight);
+
+            //CvInvoke.Line(circleImg, new Point((int)_currCircle.Center.X, (int)_currCircle.Center.X), bestPoint, new Bgr(0, 255, 0).MCvScalar, 2);
+            CvInvoke.Line(circleImg, new Point((int)_currCircle.Center.X, (int)_currCircle.Center.Y), new Point((int)_currBasketCenter.X, (int)_currBasketCenter.Y), new Bgr(0, 255, 0).MCvScalar, 2);
+            CvInvoke.Line(circleImg, new Point((int)_currCircle.Center.X, (int)_currCircle.Center.Y), new Point((int)realPos.X, (int)realPos.Y), new Bgr(0, 0, 255).MCvScalar, 2);
+
+            //PointF basketPosDelta = new PointF((float)(_currBasketCenter.X - prevBasketCenter.X), (float)(_currBasketCenter.Y - prevBasketCenter.Y));
+            //velBasket = basketPosDelta;
+            //prevBasketCenter = _currBasketCenter;
+
+            //CvInvoke.Circle(circleImg, _currBasketCenter)
+
+
+            if (_foundScreen && _foundCircle)
+            {
+                CvInvoke.PutText(circleImg, String.Format("Points: {0}", _points), new Point(10, 45), FontFace.HersheySimplex, 0.5, new Bgr(0, 255, 0).MCvScalar, 1);
+            }
+
+            CvInvoke.PutText(circleImg, String.Format("BasketVel: ({0}, {1})", velBasket.X, velBasket.Y), new Point(10, 65), FontFace.HersheySimplex, 0.5, new Bgr(0, 255, 0).MCvScalar, 1);
+            CvInvoke.PutText(circleImg, String.Format("VertRatio: ({0}, {1})", vertDist2, vertRatio2), new Point(10, 80), FontFace.HersheySimplex, 0.5, new Bgr(0, 255, 0).MCvScalar, 1);
+            CvInvoke.PutText(circleImg, String.Format("min/max: ({0}, {1})", minVertPos, maxVertPos), new Point(10, 95), FontFace.HersheySimplex, 0.5, new Bgr(0, 255, 0).MCvScalar, 1);
+            CvInvoke.PutText(circleImg, String.Format("const vel: ({0}, {1})", currVelocity.X, currVelocity.Y), new Point(10, 110), FontFace.HersheySimplex, 0.5, new Bgr(0, 255, 0).MCvScalar, 1);
 
             // CvInvoke.PutText(circleImg, "Test", new Point(10, 100), FontFace.HersheySimplex, 1, new Bgr(0, 255, 0).MCvScalar, 1);
 
